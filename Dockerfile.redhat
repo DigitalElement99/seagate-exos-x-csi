@@ -17,6 +17,8 @@ COPY ./go.* ./
 COPY cmd cmd
 COPY pkg pkg
 COPY Makefile ./
+# Local api-go replacement — provided via `docker build --build-context apigo=../seagate-exos-x-api-go`
+COPY --from=apigo . seagate-exos-x-api-go
 
 RUN echo -e "package common\nconst Version = \"${version}\"" > ./pkg/common/version.go
 
