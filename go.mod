@@ -42,6 +42,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-//replace github.com/Seagate/seagate-exos-x-api-go/v2 => ./seagate-exos-x-api-go
+replace github.com/Seagate/seagate-exos-x-api-go/v2 => ./seagate-exos-x-api-go
+
 // replace github.com/Seagate/csi-lib-iscsi => ../csi-lib-iscsi
 // replace github.com/Seagate/csi-lib-sas => ../csi-lib-sas
