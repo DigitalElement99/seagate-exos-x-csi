@@ -34,7 +34,8 @@ func (controller *Controller) CreateSnapshot(ctx context.Context, req *csi.Creat
 	}
 
 	respStatus, err := controller.client.CreateSnapshot(sourceVolumeId, snapshotName)
-	if err != nil && respStatus.ReturnCode != storageapitypes.SnapshotAlreadyExists {
+	// respStatus is nil when the request fails at the HTTP layer (e.g. 401 from the MC)
+	if err != nil && (respStatus == nil || respStatus.ReturnCode != storageapitypes.SnapshotAlreadyExists) {
 		return nil, err
 	}
 
@@ -93,7 +94,7 @@ func (controller *Controller) ListSnapshots(ctx context.Context, req *csi.ListSn
 	// BadInputParam is returned from the controller when an invalid volume is specified,
 	// so return an empty response object in this case
 	if err != nil {
-		if respStatus.ReturnCode == storageapitypes.BadInputParam {
+		if respStatus != nil && respStatus.ReturnCode == storageapitypes.BadInputParam {
 			return &csi.ListSnapshotsResponse{
 				Entries:   []*csi.ListSnapshotsResponse_Entry{},
 				NextToken: "",
