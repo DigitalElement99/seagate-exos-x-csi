@@ -104,7 +104,7 @@ func (controller *Controller) CreateVolume(ctx context.Context, req *csi.CreateV
 			}
 			apiStatus, err2 := controller.client.CopyVolume(sourceName, volumeName, parameters[common.PoolConfigKey])
 			if err2 != nil {
-				klog.Infof("-- CopyVolume apiStatus.ReturnCode %v", apiStatus.ReturnCode)
+				klog.Infof("-- CopyVolume apiStatus %+v", apiStatus)
 				if apiStatus != nil && apiStatus.ReturnCode == storageapitypes.SnapshotNotFoundErrorCode {
 					return nil, status.Errorf(codes.NotFound, "Snapshot source (%s) not found", sourceId)
 				} else {
