@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -103,8 +104,6 @@ func NewDriver(collectors ...prometheus.Collector) *Driver {
 	return &Driver{exporter: exporter}
 }
 
-var routineTimers = map[string]time.Time{}
-
 func (driver *Driver) InitServer(unaryServerInterceptors ...grpc.UnaryServerInterceptor) {
 	interceptors := append([]grpc.UnaryServerInterceptor{
 		func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
@@ -121,7 +120,10 @@ func (driver *Driver) InitServer(unaryServerInterceptors ...grpc.UnaryServerInte
 	)
 }
 
-var routineDepth = 0
+// routineDepth is written from every concurrent gRPC handler; the per-call
+// timer is a local (each call only ever reads its own start time — the shared
+// routineTimers map this replaces caused "fatal error: concurrent map writes").
+var routineDepth atomic.Int64
 var mu sync.Mutex
 var useMutex = false
 
@@ -130,19 +132,14 @@ func NewLogRoutineServerInterceptor(shouldLogRoutine func(string) bool) grpc.Una
 		if shouldLogRoutine(info.FullMethod) {
 			uuid := uuid.New().String()
 			shortuuid := uuid[strings.LastIndex(uuid, "-")+1:]
-			klog.Infof("=== [ROUTINE REQUEST] [%d] %s (%s) <0s> ===", routineDepth, info.FullMethod, shortuuid)
-			routineTimers[shortuuid] = time.Now()
+			klog.Infof("=== [ROUTINE REQUEST] [%d] %s (%s) <0s> ===", routineDepth.Load(), info.FullMethod, shortuuid)
+			start := time.Now()
 			if useMutex {
 				mu.Lock()
 			}
-			routineDepth++
-			duration := time.Since(routineTimers[shortuuid])
-			klog.Infof("=== [ROUTINE START] [%d] %s (%s) <%s> ===", routineDepth, info.FullMethod, shortuuid, duration)
+			klog.Infof("=== [ROUTINE START] [%d] %s (%s) <%s> ===", routineDepth.Add(1), info.FullMethod, shortuuid, time.Since(start))
 			defer func() {
-				routineDepth--
-				duration := time.Since(routineTimers[shortuuid])
-				klog.Infof("=== [ROUTINE END] [%d] %s (%s) <%s> ===", routineDepth, info.FullMethod, shortuuid, duration)
-				delete(routineTimers, shortuuid)
+				klog.Infof("=== [ROUTINE END] [%d] %s (%s) <%s> ===", routineDepth.Add(-1), info.FullMethod, shortuuid, time.Since(start))
 				if useMutex {
 					mu.Unlock()
 				}
