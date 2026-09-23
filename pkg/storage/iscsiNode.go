@@ -206,18 +206,28 @@ func (iscsi *iscsiStorage) DetachStorage(ctx context.Context, req *csi.NodeUnpub
 		return nil
 	}
 
+	wwn, _ := common.VolumeIdGetWwn(req.GetVolumeId())
+
 	// If the multipath device has no underlying SCSI paths, the array side has
 	// already detached and the device is an orphan dm map that csi-lib-iscsi's
-	// `multipath -f` will refuse to flush (returning a generic exit-1). Treat
-	// this as already-disconnected so subsequent VolumeAttachment cleanup can
+	// `multipath -f` will refuse to flush (returning a generic exit-1). Purge
+	// what a previous partial cleanup left behind and treat the volume as
+	// already-disconnected so subsequent VolumeAttachment cleanup can
 	// proceed; otherwise the kubelet/external-attacher loop forever.
 	if multipathDeviceIsOrphan(connector.DevicePath) {
-		klog.InfoS("multipath device has no underlying SCSI paths, assuming volume is already disconnected at the array side", "device", connector.DevicePath)
+		klog.InfoS("multipath device has no underlying SCSI paths, purging leftovers and assuming volume is already disconnected at the array side", "device", connector.DevicePath)
+		purgeOrphanMultipathDevice(connector.DevicePath, wwn)
 		os.Remove(iscsi.connectorInfoPath)
 		return nil
 	}
 
-	wwn, _ := common.VolumeIdGetWwn(req.GetVolumeId())
+	// Partitioned volumes (Windows-disk clones) carry kpartx `-partN` maps
+	// stacked on the multipath map. They keep it open, so csi-lib-iscsi's
+	// `dmsetup remove -f` only swaps in an error table (dropping the slaves),
+	// `multipath -f` then fails and the SCSI devices are never removed. Drop
+	// the holders first so the normal flush + device removal can succeed.
+	removeDmHolders(connector.DevicePath)
+
 	out, err := exec.Command("ls", "-l", fmt.Sprintf("/dev/disk/by-id/dm-name-3%s", wwn)).CombinedOutput()
 	klog.Infof("check for dm-name: ls -l %s, err = %v, out = \n%s", fmt.Sprintf("/dev/disk/by-id/dm-name-3%s", wwn), err, string(out))
 
@@ -225,13 +235,15 @@ func (iscsi *iscsiStorage) DetachStorage(ctx context.Context, req *csi.NodeUnpub
 	err = iscsilib.DisconnectVolume(*connector)
 	if err != nil {
 		// Idempotency: re-check after a failed Disconnect. If the device is
-		// gone, or has been left as an orphan dm map (no underlying SCSI
-		// paths) by a prior partial cleanup, the volume is effectively
-		// disconnected from this node and another retry will not change that.
+		// gone, the volume is disconnected. If it was left as an orphan dm
+		// map (error table, no slaves) the flush failed part-way: remove the
+		// map and the SCSI paths ourselves, then treat it as disconnected —
+		// another retry of the library path would not change anything.
 		if _, statErr := os.Stat(connector.DevicePath); os.IsNotExist(statErr) {
 			klog.InfoS("DisconnectVolume returned an error but device path is gone, assuming success", "err", err, "device", connector.DevicePath)
 		} else if multipathDeviceIsOrphan(connector.DevicePath) {
-			klog.InfoS("DisconnectVolume returned an error but device has no underlying SCSI paths, assuming success", "err", err, "device", connector.DevicePath)
+			klog.InfoS("DisconnectVolume returned an error and left an orphan dm map, purging leftovers and assuming success", "err", err, "device", connector.DevicePath)
+			purgeOrphanMultipathDevice(connector.DevicePath, wwn)
 		} else {
 			return err
 		}
@@ -253,12 +265,89 @@ func multipathDeviceIsOrphan(devicePath string) bool {
 	if devicePath == "" {
 		return false
 	}
-	slavesDir := filepath.Join("/sys/block", filepath.Base(devicePath), "slaves")
+	slavesDir := filepath.Join(sysBlockPath, filepath.Base(devicePath), "slaves")
 	entries, err := os.ReadDir(slavesDir)
 	if err != nil {
 		return false
 	}
 	return len(entries) == 0
+}
+
+// sysBlockPath is a variable so tests can point the sysfs helpers at a fixture tree.
+var sysBlockPath = "/sys/block"
+
+// sysfsWwid converts a volume WWN (dm-name convention, optionally carrying the
+// NAA type digit "3" in front) into the "naa.<wwn>" string the kernel reports
+// in /sys/block/sd*/device/wwid.
+func sysfsWwid(wwn string) string {
+	return "naa." + strings.TrimPrefix(strings.ToLower(wwn), "3")
+}
+
+// scsiDevicesByWwn lists the sd* block devices whose sysfs wwid matches wwn.
+func scsiDevicesByWwn(wwn string) []string {
+	if wwn == "" {
+		return nil
+	}
+	want := sysfsWwid(wwn)
+	files, _ := filepath.Glob(filepath.Join(sysBlockPath, "sd*", "device", "wwid"))
+	var devs []string
+	for _, f := range files {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(string(raw)), want) {
+			devs = append(devs, filepath.Base(filepath.Dir(filepath.Dir(f))))
+		}
+	}
+	return devs
+}
+
+// removeDmHolders removes the device-mapper devices stacked on devicePath —
+// the kpartx `<wwid>-partN` maps udev creates for partitioned volumes. Nothing
+// mounts them (the volume itself was already checked with findmnt), but they
+// keep the multipath map open, which breaks `multipath -f`. Best effort: a
+// holder that refuses to go is logged and the flush fails as before.
+func removeDmHolders(devicePath string) {
+	holders, err := os.ReadDir(filepath.Join(sysBlockPath, filepath.Base(devicePath), "holders"))
+	if err != nil {
+		return
+	}
+	for _, h := range holders {
+		raw, err := os.ReadFile(filepath.Join(sysBlockPath, h.Name(), "dm", "name"))
+		if err != nil {
+			continue
+		}
+		name := strings.TrimSpace(string(raw))
+		if out, err := exec.Command("dmsetup", "remove", name).CombinedOutput(); err != nil {
+			klog.InfoS("failed to remove dm holder", "holder", name, "device", devicePath, "err", err, "out", string(out))
+			continue
+		}
+		klog.InfoS("removed dm holder", "holder", name, "device", devicePath)
+	}
+}
+
+// purgeOrphanMultipathDevice cleans up after a failed flush: removes the
+// holders and the orphan map (error table, no slaves — invisible to multipathd,
+// so nothing else ever reclaims it) and deletes the SCSI devices still carrying
+// the volume's WWN, which csi-lib-iscsi never reached. Without this the stale
+// paths accumulate on the node and multipathd logs a TUR failure for each one
+// every few seconds.
+func purgeOrphanMultipathDevice(devicePath, wwn string) {
+	removeDmHolders(devicePath)
+	if out, err := exec.Command("dmsetup", "remove", devicePath).CombinedOutput(); err != nil {
+		klog.InfoS("failed to remove orphan dm map", "device", devicePath, "err", err, "out", string(out))
+	} else {
+		klog.InfoS("removed orphan dm map", "device", devicePath)
+	}
+	devs := scsiDevicesByWwn(wwn)
+	if len(devs) == 0 {
+		return
+	}
+	klog.InfoS("deleting stale scsi devices left by the failed unstage", "devices", devs, "wwn", wwn)
+	if err := iscsilib.RemovePhysicalDevice(devs...); err != nil {
+		klog.InfoS("failed to delete stale scsi devices", "devices", devs, "err", err)
+	}
 }
 
 func (iscsi *iscsiStorage) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
@@ -344,9 +433,7 @@ func purgeStaleScsiLun(targetIqn string, lun int32, expectedWwn string) error {
 	// the explicit "3" type digit on top of that to form "3600c0ff...". The
 	// volume handle we receive here tracks the dm-name convention, so strip
 	// any leading "3" before composing the sysfs comparison value.
-	wwn := strings.ToLower(expectedWwn)
-	wwn = strings.TrimPrefix(wwn, "3")
-	expectedWwid := "naa." + wwn
+	expectedWwid := sysfsWwid(expectedWwn)
 
 	sessionTargetNames, err := filepath.Glob("/sys/class/iscsi_session/session*/targetname")
 	if err != nil {
