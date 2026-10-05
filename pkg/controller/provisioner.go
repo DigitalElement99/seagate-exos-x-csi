@@ -127,9 +127,15 @@ func (controller *Controller) CreateVolume(ctx context.Context, req *csi.CreateV
 	if wwn == "" {
 		wwn, err = controller.client.GetVolumeWwn(volumeName)
 	}
+	if err == nil && wwn == "" {
+		err = fmt.Errorf("array returned no WWN for volume %s", volumeName)
+	}
 	if err != nil {
+		// Never mint a volume ID with an empty WWN (it can never publish);
+		// returning an error lets csi-provisioner retry CreateVolume, which
+		// finds the volume already present and reads the WWN then.
 		klog.ErrorS(err, "Error retrieving WWN of new volume", "volumeName", volumeName)
-		return nil, err
+		return nil, status.Errorf(codes.Unavailable, "%v", err)
 	}
 
 	if storageProtocol == common.StorageProtocolISCSI {

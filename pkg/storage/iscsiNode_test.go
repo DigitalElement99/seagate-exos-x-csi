@@ -1,9 +1,14 @@
 package storage
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/container-storage-interface/spec/lib/go/csi"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestSysfsWwid(t *testing.T) {
@@ -51,5 +56,19 @@ func TestScsiDevicesByWwn(t *testing.T) {
 	}
 	if !multipathDeviceIsOrphan("/dev/dm-31") {
 		t.Error("dm-31 with empty slaves dir must be orphan")
+	}
+}
+
+// Regression (2026-10-03): a volume ID minted without a WWN (`name##iscsi##`)
+// made AttachStorage purge the LUN's correct paths and poll for
+// /dev/disk/by-id/dm-name-3 for 180 s on every kubelet retry (kubelet gives
+// up at 120 s), so the volume could never publish. Reject it up front.
+func TestAttachStorageRejectsEmptyWwn(t *testing.T) {
+	iscsi := &iscsiStorage{}
+	for _, id := range []string{"k3s_x##iscsi##", "k3s_x##iscsi", "k3s_x"} {
+		_, err := iscsi.AttachStorage(context.Background(), &csi.NodePublishVolumeRequest{VolumeId: id})
+		if status.Code(err) != codes.InvalidArgument {
+			t.Errorf("AttachStorage(%q) err = %v, want codes.InvalidArgument", id, err)
+		}
 	}
 }

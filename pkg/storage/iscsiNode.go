@@ -60,7 +60,13 @@ func (iscsi *iscsiStorage) NodeUnstageVolume(ctx context.Context, req *csi.NodeU
 }
 
 func (iscsi *iscsiStorage) AttachStorage(ctx context.Context, req *csi.NodePublishVolumeRequest) (string, error) {
-	wwn, _ := common.VolumeIdGetWwn(req.GetVolumeId())
+	wwn, err := common.VolumeIdGetWwn(req.GetVolumeId())
+	if err != nil || wwn == "" {
+		// A volume ID without a WWN can never publish: the dm-name-3<WWN>
+		// wait below would poll for 180 s per kubelet retry and the stale-LUN
+		// purge would strip the volume's own paths. Fail fast instead.
+		return "", status.Errorf(codes.InvalidArgument, "volume ID %q carries no WWN", req.GetVolumeId())
+	}
 	iqn := req.GetVolumeContext()["iqn"]
 	portals := strings.Split(req.GetVolumeContext()["portals"], ",")
 	klog.InfoS("iSCSI connection info:", "iqn", iqn, "portals", portals)
