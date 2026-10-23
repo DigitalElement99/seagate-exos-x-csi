@@ -79,24 +79,30 @@ func (controller *Controller) CreateVolume(ctx context.Context, req *csi.CreateV
 
 	klog.Infof("creating volume %q (size %s) pool %q using protocol (%s)", volumeName, sizeStr, pool, storageProtocol)
 
-	volumeExists, err := controller.client.CheckVolumeExists(volumeName, size)
+	var sourceId string
+
+	if volume := req.VolumeContentSource.GetVolume(); volume != nil {
+		sourceId = volume.VolumeId
+		klog.Infof("-- GetVolume sourceID %q", sourceId)
+	}
+
+	if snapshot := req.VolumeContentSource.GetSnapshot(); sourceId == "" && snapshot != nil {
+		sourceId = snapshot.SnapshotId
+		klog.Infof("-- GetSnapshot sourceID %q", sourceId)
+	}
+
+	// A clone starts at its source's size and is grown below, so any existing
+	// clone (e.g. from an attempt that failed before the grow) is accepted here.
+	checkSize := size
+	if sourceId != "" {
+		checkSize = 0
+	}
+	volumeExists, err := controller.client.CheckVolumeExists(volumeName, checkSize)
 	if err != nil {
 		return nil, err
 	}
 
 	if !volumeExists {
-		var sourceId string
-
-		if volume := req.VolumeContentSource.GetVolume(); volume != nil {
-			sourceId = volume.VolumeId
-			klog.Infof("-- GetVolume sourceID %q", sourceId)
-		}
-
-		if snapshot := req.VolumeContentSource.GetSnapshot(); sourceId == "" && snapshot != nil {
-			sourceId = snapshot.SnapshotId
-			klog.Infof("-- GetSnapshot sourceID %q", sourceId)
-		}
-
 		if sourceId != "" {
 			sourceName, err := common.VolumeIdGetName(sourceId)
 			if err != nil {
@@ -122,6 +128,15 @@ func (controller *Controller) CreateVolume(ctx context.Context, req *csi.CreateV
 			if volume != nil {
 				wwn = volume.Wwn
 			}
+		}
+	}
+	if sourceId != "" {
+		// CopyVolume makes the clone its source's size; grow it to the requested
+		// size (a no-op when the source is already that large). On failure the
+		// provisioner retries, finds the clone and grows it then.
+		if err := controller.expandVolumeTo(volumeName, size); err != nil {
+			klog.ErrorS(err, "Error growing cloned volume", "volumeName", volumeName, "size", size)
+			return nil, status.Errorf(codes.Unavailable, "%v", err)
 		}
 	}
 	if wwn == "" {

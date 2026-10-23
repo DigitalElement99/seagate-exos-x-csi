@@ -25,25 +25,7 @@ func (controller *Controller) ControllerExpandVolume(ctx context.Context, req *c
 	}
 	klog.V(2).Infof("requested size: %d bytes", newSize)
 
-	response, _, err := controller.client.ShowVolumes(volumeName)
-	var expansionSize int64
-	if err != nil {
-		return nil, err
-	} else if len(response) == 0 {
-		return nil, fmt.Errorf("volume %q not found", volumeName)
-	} else if response[0].SizeNumeric == 0 {
-		return nil, fmt.Errorf("could not get current volume size, thus volume expansion is not possible")
-	} else if response[0].Blocks == 0 {
-		return nil, fmt.Errorf("could not parse volume size: %v", err)
-	} else {
-		currentSize := response[0].Blocks * response[0].BlockSize
-		klog.V(2).Infof("current size: %d bytes", currentSize)
-		expansionSize = newSize - currentSize
-		klog.V(2).Infof("expanding volume by %d bytes", expansionSize)
-	}
-
-	expansionSizeStr := getSizeStr(expansionSize)
-	if _, err := controller.client.ExpandVolume(volumeName, expansionSizeStr); err != nil {
+	if err := controller.expandVolumeTo(volumeName, newSize); err != nil {
 		return nil, err
 	}
 
@@ -53,4 +35,37 @@ func (controller *Controller) ControllerExpandVolume(ctx context.Context, req *c
 		CapacityBytes:         newSize,
 		NodeExpansionRequired: true,
 	}, nil
+}
+
+// expandVolumeTo grows volumeName to at least newSize bytes. A volume already
+// that large is left alone, so a repeated call is a no-op (CSI requires
+// ControllerExpandVolume and CreateVolume to be idempotent).
+func (controller *Controller) expandVolumeTo(volumeName string, newSize int64) error {
+	response, _, err := controller.client.ShowVolumes(volumeName)
+	if err != nil {
+		return err
+	} else if len(response) == 0 {
+		return fmt.Errorf("volume %q not found", volumeName)
+	} else if response[0].SizeNumeric == 0 {
+		return fmt.Errorf("could not get current volume size, thus volume expansion is not possible")
+	} else if response[0].Blocks == 0 {
+		return fmt.Errorf("could not parse volume size: %v", err)
+	}
+
+	currentSize := response[0].Blocks * response[0].BlockSize
+	expansionSize := bytesToGrow(currentSize, newSize)
+	klog.V(2).Infof("volume %q current size: %d bytes, expanding by %d bytes", volumeName, currentSize, expansionSize)
+	if expansionSize == 0 {
+		return nil
+	}
+	_, err = controller.client.ExpandVolume(volumeName, getSizeStr(expansionSize))
+	return err
+}
+
+// bytesToGrow is how much a volume of current bytes must grow to hold required.
+func bytesToGrow(current, required int64) int64 {
+	if required <= current {
+		return 0
+	}
+	return required - current
 }
