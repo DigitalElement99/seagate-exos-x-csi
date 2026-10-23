@@ -162,7 +162,7 @@ func newSnapshotFromResponse(snapshot *storageapitypes.SnapshotObject) (*csi.Sna
 	klog.InfoS("csi snapshot info", "snapshot", snapshot.Name, "volume", snapshot.MasterVolumeName, "creationTime", snapshot.CreationTime)
 
 	return &csi.Snapshot{
-		SizeBytes:      snapshot.TotalSizeNumeric,
+		SizeBytes:      snapshot.TotalSizeNumeric * 512, // total-size-numeric is in 512-byte blocks
 		SnapshotId:     snapshot.Name,
 		SourceVolumeId: snapshot.MasterVolumeName,
 		CreationTime:   snapshot.CreationTime,
