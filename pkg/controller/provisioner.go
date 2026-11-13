@@ -195,20 +195,35 @@ func (controller *Controller) DeleteVolume(ctx context.Context, req *csi.DeleteV
 	klog.Infof("deleting volume %s", volumeName)
 
 	respStatus, err := controller.client.DeleteVolume(volumeName)
-	if err != nil {
-		if respStatus != nil {
-			if respStatus.ReturnCode == storageapitypes.VolumeNotFoundErrorCode {
-				klog.Infof("volume %s does not exist, assuming it has already been deleted", volumeName)
-				return &csi.DeleteVolumeResponse{}, nil
-			} else if respStatus.ReturnCode == storageapitypes.VolumeHasSnapshot {
-				return nil, status.Error(codes.FailedPrecondition, fmt.Sprintf("volume %s cannot be deleted since it has snapshots", volumeName))
-			}
-		}
+	if err := deleteVolumeError(volumeName, respStatus, err); err != nil {
 		return nil, err
 	}
 
 	klog.Infof("successfully deleted volume %s", volumeName)
 	return &csi.DeleteVolumeResponse{}, nil
+}
+
+// deleteVolumeError maps the array's answer to a DeleteVolume result. The
+// array refuses with HTTP 200 and an Error status, which api-go returns as
+// err == nil, so the status must be checked on that path too: a volume with
+// snapshots was reported deleted and its PV removed, orphaning the LUN.
+func deleteVolumeError(volumeName string, respStatus *storageapitypes.ResponseStatus, err error) error {
+	if err == nil && (respStatus == nil || respStatus.ResponseTypeNumeric == 0) {
+		return nil
+	}
+	if respStatus != nil {
+		switch respStatus.ReturnCode {
+		case storageapitypes.VolumeNotFoundErrorCode:
+			klog.Infof("volume %s does not exist, assuming it has already been deleted", volumeName)
+			return nil
+		case storageapitypes.VolumeHasSnapshot:
+			return status.Error(codes.FailedPrecondition, fmt.Sprintf("volume %s cannot be deleted since it has snapshots", volumeName))
+		}
+	}
+	if err == nil {
+		err = status.Error(codes.Internal, fmt.Sprintf("delete volume %s: array returned %d: %s", volumeName, respStatus.ReturnCode, respStatus.Response))
+	}
+	return err
 }
 
 func getSizeStr(size int64) string {
