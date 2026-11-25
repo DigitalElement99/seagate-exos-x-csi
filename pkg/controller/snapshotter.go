@@ -75,15 +75,30 @@ func (controller *Controller) DeleteSnapshot(ctx context.Context, req *csi.Delet
 		return nil, status.Error(codes.InvalidArgument, "DeleteSnapshot snapshot id is required")
 	}
 
-	status, err := controller.client.DeleteSnapshot(req.SnapshotId)
-	if err != nil {
-		if status != nil && status.ReturnCode == storageapitypes.SnapshotNotFoundErrorCode {
-			klog.Infof("snapshot %s does not exist, assuming it has already been deleted", req.SnapshotId)
-			return &csi.DeleteSnapshotResponse{}, nil
-		}
+	respStatus, err := controller.client.DeleteSnapshot(req.SnapshotId)
+	if err := deleteSnapshotError(req.SnapshotId, respStatus, err); err != nil {
 		return nil, err
 	}
 	return &csi.DeleteSnapshotResponse{}, nil
+}
+
+// deleteSnapshotError maps the array's answer to a DeleteSnapshot result. Like
+// DeleteVolume, a refused delete comes back as HTTP 200 with an Error status
+// (err == nil), which used to be reported as success: the VolumeSnapshotContent
+// went and the array snapshot leaked (#214). A missing snapshot answers -10050
+// "The volume was not found on this system" (probed on the ME5024 2026-11-25).
+func deleteSnapshotError(snapshotId string, respStatus *storageapitypes.ResponseStatus, err error) error {
+	if err == nil && (respStatus == nil || respStatus.ResponseTypeNumeric == 0) {
+		return nil
+	}
+	if respStatus != nil && respStatus.ReturnCode == storageapitypes.SnapshotNotFoundErrorCode {
+		klog.Infof("snapshot %s does not exist, assuming it has already been deleted", snapshotId)
+		return nil
+	}
+	if err == nil {
+		err = status.Error(codes.Internal, fmt.Sprintf("delete snapshot %s: array returned %d: %s", snapshotId, respStatus.ReturnCode, respStatus.Response))
+	}
+	return err
 }
 
 // ListSnapshots: list existing snapshots up to MaxEntries
